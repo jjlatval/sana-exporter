@@ -1,0 +1,9 @@
+# Never commit these: they hold your login session and your company's data.
+.sana-browser-profile/
+transcripts/
+drive_upload/
+download_log.csv
+folder_mapping.csv
+
+node_modules/
+.DS_Store

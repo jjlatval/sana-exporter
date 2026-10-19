@@ -1,0 +1,35 @@
+{
+  "name": "sana-exporter",
+  "version": "1.0.0",
+  "description": "Bulk-export meeting transcripts from Sana AI (which has no transcript API) and organize them into folders for Google Drive.",
+  "license": "MIT",
+  "scripts": {
+    "export": "node export.js",
+    "organize": "node organize.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "sana",
+    "sana-ai",
+    "export",
+    "transcripts",
+    "meeting-notes",
+    "google-drive",
+    "playwright"
+  ],
+  "dependencies": {
+    "playwright": "^1.64.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jjlatval/sana-exporter.git"
+  },
+  "homepage": "https://github.com/jjlatval/sana-exporter#readme",
+  "bugs": {
+    "url": "https://github.com/jjlatval/sana-exporter/issues"
+  },
+  "author": "Joni Latvala",
+  "private": false
+}
