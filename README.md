@@ -64,14 +64,17 @@ You only log in once: the session is kept in `.sana-browser-profile/`. The scrip
 | `transcripts/` | One `.docx` per call: `YYYY-MM-DD_<Sana folder>_<call title>.docx` |
 | `download_log.csv` | One row per folder and call: folder and call ids, date, file name, status |
 
-You can stop it with Ctrl+C and run it again whenever you like. Finished calls are skipped and failed ones are retried. Expect a few hours for a few thousand calls.
+You can stop it with Ctrl+C and run it again whenever you like. Finished calls are skipped and failed ones are retried. Expect about 200 calls an hour, so a few thousand calls take a night. Run it once more at the end to retry the calls that timed out.
 
 <details>
 <summary>Statuses in <code>download_log.csv</code></summary>
 
-- `downloaded`: saved
+- `downloaded`: saved and checked: the title inside the file is the call's title, and no other call's file has the same text
 - `skipped_no_transcript`: Sana says the call has no transcript (not retried)
+- `wrong_transcript`: the file held a different call; it was moved to `transcripts/_rejected/` and is retried on the next run
 - `downloaded_suspicious`, `skipped_unknown`, `skipped_no_menu_item`, `error: ...`: retried on the next run
+
+Every run first re-checks the files it already downloaded, so running it again also repairs an export made with an older version.
 
 </details>
 

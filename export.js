@@ -17,12 +17,15 @@
 //   ./download_log.csv   one row per (folder, call), used to resume and by organize.js
 //
 // Safe to stop (Ctrl+C) and re-run: calls already logged as 'downloaded' or
-// 'skipped_no_transcript' are skipped; everything else is retried.
+// 'skipped_no_transcript' are skipped; everything else is retried. Every downloaded
+// file is checked against the call it was saved as; files that hold another call
+// are moved to ./transcripts/_rejected and retried.
 
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
-const { LOG_HEADER, sanitize, csvEscape, readCsvObjects, parseArgs } = require('./lib/common');
+const { LOG_HEADER, sanitize, csvEscape, readCsvObjects, latestRows, parseArgs } = require('./lib/common');
+const { readTranscript, sameTitle } = require('./lib/transcript');
 
 const args = parseArgs(process.argv.slice(2));
 
@@ -48,6 +51,7 @@ if (workspaceArg) {
 const DATA_DIR = path.resolve(args.dir || '.');
 const USER_DATA_DIR = path.join(DATA_DIR, '.sana-browser-profile');
 const DOWNLOAD_DIR = path.join(DATA_DIR, 'transcripts');
+const REJECTED_DIR = path.join(DOWNLOAD_DIR, '_rejected');
 const LOG_CSV = path.join(DATA_DIR, 'download_log.csv');
 
 const MONTHS = {
@@ -74,21 +78,62 @@ function appendLogRow(row) {
   fs.appendFileSync(LOG_CSV, LOG_HEADER.map((h) => csvEscape(row[h])).join(',') + '\n');
 }
 
+// Moves a file that failed its check out of transcripts/, so organize.js never
+// picks it up and its name is free for the re-download.
+function reject(filename) {
+  const src = path.join(DOWNLOAD_DIR, filename);
+  if (!fs.existsSync(src)) return;
+  fs.mkdirSync(REJECTED_DIR, { recursive: true });
+  let dest = path.join(REJECTED_DIR, filename);
+  for (let n = 1; fs.existsSync(dest); n++) dest = path.join(REJECTED_DIR, filename.replace(/\.docx$/, ` (${n}).docx`));
+  fs.renameSync(src, dest);
+}
+
 function loadLog() {
   // done: folder+call pairs not to retry. downloaded: assetId -> file already on disk,
   // so a call that sits in several folders is only fetched from Sana once.
+  // owners: transcript fingerprint -> assetId, to spot a file holding another call's text.
   const done = new Set();
   const downloaded = new Map();
-  if (!fs.existsSync(LOG_CSV)) return { done, downloaded };
-  for (const r of readCsvObjects(LOG_CSV)) {
-    if (r.status === 'downloaded' || r.status === 'skipped_no_transcript') {
+  const owners = new Map();
+  if (!fs.existsSync(LOG_CSV)) return { done, downloaded, owners };
+
+  const rows = latestRows(readCsvObjects(LOG_CSV));
+  const onDisk = [];
+  for (const r of rows) {
+    if (r.status === 'skipped_no_transcript') done.add(`${r.folderId}|||${r.assetHref}`);
+    if (r.status !== 'downloaded') continue;
+    const file = path.join(DOWNLOAD_DIR, r.savedFilename);
+    if (fs.existsSync(file)) onDisk.push({ r, doc: readTranscript(file) });
+    else done.add(`${r.folderId}|||${r.assetHref}`);
+  }
+
+  // Re-check earlier downloads: versions before this check saved the previous
+  // call's transcript under the next call's name. A file is kept only if its title
+  // is the call's title and no other call's file has the same text.
+  const callsWithText = new Map();
+  for (const { r, doc } of onDisk) {
+    if (!doc) continue;
+    const ids = callsWithText.get(doc.fingerprint) || new Set();
+    callsWithText.set(doc.fingerprint, ids.add(r.assetId));
+  }
+  let rejected = 0;
+  for (const { r, doc } of onDisk) {
+    if (doc && sameTitle(doc.title, r.callTitle) && callsWithText.get(doc.fingerprint).size === 1) {
       done.add(`${r.folderId}|||${r.assetHref}`);
-    }
-    if (r.status === 'downloaded' && fs.existsSync(path.join(DOWNLOAD_DIR, r.savedFilename))) {
       downloaded.set(r.assetId, r.savedFilename);
+      owners.set(doc.fingerprint, r.assetId);
+    } else {
+      reject(r.savedFilename);
+      appendLogRow({ ...r, status: 'wrong_transcript' });
+      rejected++;
     }
   }
-  return { done, downloaded };
+  if (rejected) {
+    console.log(`${rejected} earlier downloads contain a different call than their name says.`);
+    console.log(`Moved them to ${REJECTED_DIR}; they will be downloaded again.`);
+  }
+  return { done, downloaded, owners };
 }
 
 // Never overwrite an existing file, including ones from earlier runs.
@@ -135,8 +180,10 @@ async function collectFolders(page) {
   return Array.from(folders.values()).sort((a, b) => a.position - b.position);
 }
 
+const CALL_LINK = 'a[href*="/agent#with="]';
+
 async function scrapeListItems(page) {
-  return page.$$eval('a[href*="/agent#with="]', (anchors) =>
+  return page.$$eval(CALL_LINK, (anchors) =>
     anchors.map((a) => {
       const text = a.innerText || '';
       const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
@@ -150,6 +197,10 @@ async function scrapeListItems(page) {
 
 async function collectAllItemsInFolder(page, folderId) {
   await page.goto(`${WORKSPACE}/folders/${folderId}`, { waitUntil: 'domcontentloaded' });
+  // The call list renders a moment after the page. Read too early, a full folder
+  // looks empty and is silently skipped, so wait for the first call to appear.
+  // A folder that really is empty costs the 15 s timeout.
+  await page.waitForSelector(CALL_LINK, { timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(1200);
 
   const items = [];
@@ -170,7 +221,15 @@ async function collectAllItemsInFolder(page, folderId) {
     if (nextCount === 0) break;
     const isDisabled = await nextBtn.first().isDisabled().catch(() => true);
     if (isDisabled) break;
+    // Wait for the next page to replace this one; otherwise this page is read
+    // twice and the following click jumps past the next page.
+    const firstHref = pageItems.length ? pageItems[0].href : null;
     await nextBtn.first().click();
+    await page.waitForFunction(
+      ([sel, href]) => document.querySelector(sel)?.getAttribute('href') !== href,
+      [CALL_LINK, firstHref],
+      { timeout: 15000 },
+    ).catch(() => {});
     await page.waitForTimeout(600);
   }
 
@@ -178,6 +237,10 @@ async function collectAllItemsInFolder(page, folderId) {
 }
 
 async function downloadTranscriptForCall(page, href) {
+  // Calls differ only after the '#' (.../agent#with=<id>), so going straight from one
+  // call to the next is an in-page hash change: Sana keeps the previous call open
+  // and its transcript gets downloaded again. Leaving the page forces a full load.
+  await page.goto('about:blank');
   await page.goto(`https://sana.ai${href}`, { waitUntil: 'domcontentloaded' });
 
   // Scoped to the header toolbar (<nav class="navigation-bar...">) so this never
@@ -219,7 +282,7 @@ async function downloadTranscriptForCall(page, href) {
 
 (async () => {
   fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
-  const { done, downloaded } = loadLog();
+  const { done, downloaded, owners } = loadLog();
 
   const context = await chromium.launchPersistentContext(USER_DATA_DIR, {
     headless: false,
@@ -287,14 +350,23 @@ async function downloadTranscriptForCall(page, href) {
           const destPath = path.join(DOWNLOAD_DIR, finalName);
           await result.download.saveAs(destPath);
 
-          // Sanity check: a real .docx is a zip file, so it must start with "PK".
-          const buf = fs.readFileSync(destPath);
-          const looksLikeDocx = buf.length > 500 && buf[0] === 0x50 && buf[1] === 0x4b;
-          const finalStatus = looksLikeDocx ? 'downloaded' : 'downloaded_suspicious';
-          if (looksLikeDocx) downloaded.set(assetId, finalName);
+          // Check it is the call we asked for: a readable .docx whose title is this
+          // call's title and whose text no other call has.
+          const doc = readTranscript(destPath);
+          const owner = doc && owners.get(doc.fingerprint);
+          let status = 'downloaded';
+          if (!doc) status = 'downloaded_suspicious';
+          else if (!sameTitle(doc.title, item.title) || (owner && owner !== assetId)) status = 'wrong_transcript';
 
-          console.log(`  [${looksLikeDocx ? 'OK' : 'CHECK ME'}] ${item.title} -> ${finalName}`);
-          appendLogRow({ ...logRow, savedFilename: finalName, status: finalStatus });
+          if (status === 'downloaded') {
+            downloaded.set(assetId, finalName);
+            owners.set(doc.fingerprint, assetId);
+            console.log(`  [OK] ${item.title} -> ${finalName}`);
+          } else {
+            reject(finalName);
+            console.log(`  [${status}, will retry] ${item.title}${doc ? ` (file contains: ${doc.title})` : ''}`);
+          }
+          appendLogRow({ ...logRow, savedFilename: finalName, status });
         } else {
           console.log(`  [SKIP: ${result.status}] ${item.title}`);
           appendLogRow({ ...logRow, savedFilename: '', status: result.status });

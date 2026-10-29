@@ -28,7 +28,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { sanitize, toCsv, readCsvObjects, parseArgs } = require('./lib/common');
+const { sanitize, toCsv, readCsvObjects, latestRows, parseArgs } = require('./lib/common');
 
 const MAPPING_HEADER = ['sana_folder_position', 'sana_folder_name', 'sana_folder_id', 'calls', 'drive_folder'];
 const MAX_TITLE_CHARS = 150;
@@ -60,7 +60,7 @@ function initMapping(args) {
   }
 
   const folders = new Map();
-  for (const r of loadLog(logFile)) {
+  for (const r of latestRows(loadLog(logFile))) {
     const f = folders.get(r.folderId) || {
       sana_folder_position: r.folderPosition, sana_folder_name: r.folderName,
       sana_folder_id: r.folderId, calls: 0,
@@ -101,7 +101,7 @@ function build(args) {
   const mapping = new Map();
   for (const m of readCsvObjects(mappingFile)) mapping.set(m.sana_folder_id, cleanDrivePath(m.drive_folder || ''));
 
-  const rows = loadLog(logFile)
+  const rows = latestRows(loadLog(logFile))
     .filter((r) => r.status === 'downloaded')
     .sort((a, b) => a.folderPosition - b.folderPosition);
 
